@@ -39,6 +39,16 @@ copy .env.example .env
 go run ./cmd/local
 ```
 
+`go run ./cmd/local` membaca `.env`, cek sekarang, lalu tetap hidup dan cek lagi setiap 30 menit. Hentikan dengan Ctrl+C.
+
+Sekali cek lalu keluar:
+
+```powershell
+go run ./cmd/local --once
+```
+
+Di Vercel isi env lewat Settings, bukan file `.env`. Vercel memanggil `/api/cron` sekali per jadwal, bukan proses yang hidup terus.
+
 Atau setelah `vercel dev`:
 
 ```powershell

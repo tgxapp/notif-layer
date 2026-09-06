@@ -1,14 +1,18 @@
 package check
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,14 +21,21 @@ const (
 	commitsURL    = "https://api.github.com/repos/telegramdesktop/tdesktop/commits?path=Telegram/SourceFiles/mtproto/scheme/api.tl&per_page=12"
 	defaultChatID = int64(7506666666)
 	userAgent     = "notif-layer/1.0"
+	defaultLayer  = 214
 )
 
-var layerRE = regexp.MustCompile(`(?m)^//\s*LAYER\s+(\d+)\s*$`)
+var (
+	layerRE          = regexp.MustCompile(`(?m)^//\s*LAYER\s+(\d+)\s*$`)
+	telegramStateRE  = regexp.MustCompile(`^notif-layer\s+(\d+)(?:\s+n=([0-9a-f]+))?$`)
+	runMu            sync.Mutex
+	claimRecheckWait = 400 * time.Millisecond
+)
 
 type State struct {
 	Layer      int    `json:"layer"`
 	SHA        string `json:"sha"`
 	NotifiedAt string `json:"notified_at"`
+	Nonce      string `json:"-"`
 }
 
 type Result struct {
@@ -50,6 +61,9 @@ type githubCommit struct {
 }
 
 func Run() (Result, error) {
+	runMu.Lock()
+	defer runMu.Unlock()
+
 	latest, err := fetchLatestLayer()
 	if err != nil {
 		return Result{}, err
@@ -64,7 +78,7 @@ func Run() (Result, error) {
 		return Result{}, err
 	}
 
-	changes := changelog(commits, state.Layer, latest)
+	changes := changelog(commits, state.SHA, state.Layer, latest)
 	res := Result{
 		Previous: state.Layer,
 		Latest:   latest,
@@ -84,7 +98,18 @@ func Run() (Result, error) {
 	text := formatMessage(state.Layer, latest, changes)
 	res.Message = text
 
+	claimed, err := claimLayer(state, latest, res.SHA)
+	if err != nil {
+		return res, err
+	}
+	if !claimed {
+		res.SkipReason = "sudah dikirim proses lain"
+		res.Notified = false
+		return res, nil
+	}
+
 	if err := sendTelegram(text); err != nil {
+		_ = revertClaim(state)
 		return res, err
 	}
 	res.Notified = true
@@ -92,7 +117,9 @@ func Run() (Result, error) {
 	state.Layer = latest
 	state.SHA = res.SHA
 	state.NotifiedAt = time.Now().UTC().Format(time.RFC3339)
-	_ = saveState(state)
+	if err := saveState(state); err != nil {
+		return res, fmt.Errorf("notif terkirim, tapi state gagal disimpan: %w", err)
+	}
 	return res, nil
 }
 
@@ -120,10 +147,13 @@ func fetchCommits() ([]githubCommit, error) {
 	return commits, nil
 }
 
-func changelog(commits []githubCommit, previous, latest int) []string {
+func changelog(commits []githubCommit, lastSHA string, previous, latest int) []string {
 	var out []string
 	seen := map[string]bool{}
 	for _, c := range commits {
+		if lastSHA != "" && c.SHA == lastSHA {
+			break
+		}
 		msg := strings.TrimSpace(strings.Split(c.Commit.Message, "\n")[0])
 		if msg == "" || seen[msg] {
 			continue
@@ -158,18 +188,27 @@ func formatMessage(previous, latest int, changes []string) string {
 }
 
 func loadState() (State, error) {
-	if data, err := os.ReadFile("last_layer.json"); err == nil {
-		var state State
-		if json.Unmarshal(data, &state) == nil && state.Layer > 0 {
-			return state, nil
+	best := State{}
+	for _, path := range statePaths() {
+		if data, err := os.ReadFile(path); err == nil {
+			var state State
+			if json.Unmarshal(data, &state) == nil && state.Layer > best.Layer {
+				best = state
+			}
 		}
+	}
+	if remote, err := loadTelegramState(); err == nil && remote.Layer > best.Layer {
+		best = remote
+	}
+	if best.Layer > 0 {
+		return best, nil
 	}
 	if raw := strings.TrimSpace(os.Getenv("LAST_LAYER")); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil {
 			return State{Layer: n}, nil
 		}
 	}
-	return State{Layer: 214}, nil
+	return State{Layer: defaultLayer}, nil
 }
 
 func saveState(state State) error {
@@ -177,38 +216,203 @@ func saveState(state State) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile("last_layer.json", data, 0o644)
+	var fileErr error
+	for _, path := range statePaths() {
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			fileErr = err
+			continue
+		}
+		fileErr = nil
+		break
+	}
+	if err := saveTelegramState(state, ""); err != nil {
+		if fileErr != nil {
+			return fmt.Errorf("file: %v; telegram: %w", fileErr, err)
+		}
+		return err
+	}
+	return nil
+}
+
+func statePaths() []string {
+	var paths []string
+	if custom := strings.TrimSpace(os.Getenv("STATE_FILE")); custom != "" {
+		paths = append(paths, custom)
+	}
+	paths = append(paths, "last_layer.json", filepath.Join(os.TempDir(), "notif-layer-last.json"))
+	return paths
+}
+
+func claimLayer(previous State, latest int, sha string) (bool, error) {
+	nonce, err := newNonce()
+	if err != nil {
+		return false, err
+	}
+	current, err := loadTelegramState()
+	if err != nil {
+		current = previous
+	}
+	if latest <= current.Layer {
+		return false, nil
+	}
+	claim := State{Layer: latest, SHA: sha, Nonce: nonce}
+	if err := saveTelegramState(claim, nonce); err != nil {
+		// VPS tanpa API deskripsi bot tetap bisa lanjut; file lock di Run() menahan proses yang sama.
+		return true, nil
+	}
+	time.Sleep(claimRecheckWait)
+	again, err := loadTelegramState()
+	if err != nil {
+		return false, err
+	}
+	return again.Layer == latest && again.Nonce == nonce, nil
+}
+
+func revertClaim(previous State) error {
+	if previous.Layer <= 0 {
+		return nil
+	}
+	return saveTelegramState(previous, "")
+}
+
+func loadTelegramState() (State, error) {
+	body, err := telegramAPI("getMyShortDescription", nil)
+	if err != nil {
+		return State{}, err
+	}
+	var resp struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			ShortDescription string `json:"short_description"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return State{}, err
+	}
+	if !resp.OK {
+		return State{}, fmt.Errorf("getMyShortDescription: %s", strings.TrimSpace(string(body)))
+	}
+	state, ok := parseTelegramState(resp.Result.ShortDescription)
+	if !ok {
+		return State{}, fmt.Errorf("deskripsi bot belum berisi state")
+	}
+	return state, nil
+}
+
+func saveTelegramState(state State, nonce string) error {
+	_, err := telegramAPI("setMyShortDescription", map[string]any{
+		"short_description": formatTelegramState(state.Layer, nonce),
+	})
+	return err
+}
+
+func parseTelegramState(raw string) (State, bool) {
+	match := telegramStateRE.FindStringSubmatch(strings.TrimSpace(raw))
+	if match == nil {
+		return State{}, false
+	}
+	layer, err := strconv.Atoi(match[1])
+	if err != nil || layer <= 0 {
+		return State{}, false
+	}
+	return State{Layer: layer, Nonce: match[2]}, true
+}
+
+func formatTelegramState(layer int, nonce string) string {
+	if nonce == "" {
+		return fmt.Sprintf("notif-layer %d", layer)
+	}
+	return fmt.Sprintf("notif-layer %d n=%s", layer, nonce)
+}
+
+func newNonce() (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 func sendTelegram(text string) error {
-	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
-	if token == "" {
-		return fmt.Errorf("TELEGRAM_BOT_TOKEN kosong")
-	}
-	chatID := defaultChatID
-	if raw := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")); raw != "" {
-		if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
-			chatID = n
-		}
-	}
 	payload, err := json.Marshal(map[string]any{
-		"chat_id": chatID,
+		"chat_id": chatID(),
 		"text":    text,
 	})
 	if err != nil {
 		return err
 	}
-	url := "https://api.telegram.org/bot" + token + "/sendMessage"
-	resp, err := http.Post(url, "application/json", strings.NewReader(string(payload)))
+	body, err := telegramAPI("sendMessage", payload)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("telegram status %d: %s", resp.StatusCode, string(body))
+	var resp struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("telegram sendMessage: %s", strings.TrimSpace(string(body)))
 	}
 	return nil
+}
+
+func chatID() int64 {
+	if raw := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			return n
+		}
+	}
+	return defaultChatID
+}
+
+func botToken() (string, error) {
+	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
+	if token == "" {
+		return "", fmt.Errorf("TELEGRAM_BOT_TOKEN kosong")
+	}
+	return token, nil
+}
+
+func telegramAPI(method string, payload any) ([]byte, error) {
+	token, err := botToken()
+	if err != nil {
+		return nil, err
+	}
+	url := "https://api.telegram.org/bot" + token + "/" + method
+	var body io.Reader
+	if payload != nil {
+		raw, ok := payload.([]byte)
+		if !ok {
+			raw, err = json.Marshal(payload)
+			if err != nil {
+				return nil, err
+			}
+		}
+		body = strings.NewReader(string(raw))
+	}
+	req, err := http.NewRequest(http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("User-Agent", userAgent)
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("telegram %s status %d: %s", method, resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return respBody, nil
 }
 
 func httpGet(url string) ([]byte, error) {

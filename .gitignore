@@ -2,3 +2,4 @@
 .vercel
 *.exe
 tmp/
+last_layer.json

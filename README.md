@@ -31,6 +31,46 @@ User `7506666666` harus sudah menekan **Start** di bot, kalau tidak `sendMessage
 https://PROJECT.vercel.app/api/cron
 ```
 
+## VPS (`/opt/notif-layer`)
+
+```bash
+sudo apt update
+sudo apt install -y golang-go git
+sudo git clone https://github.com/tgxapp/notif-layer.git /opt/notif-layer
+cd /opt/notif-layer
+sudo nano .env
+```
+
+Isi `.env`:
+
+```
+TELEGRAM_BOT_TOKEN=token-dari-botfather
+TELEGRAM_CHAT_ID=7506666666
+```
+
+```bash
+sudo go build -o /opt/notif-layer/notif-layer ./cmd/local
+sudo cp /opt/notif-layer/notif-layer.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now notif-layer
+sudo systemctl status notif-layer
+```
+
+Log:
+
+```bash
+journalctl -u notif-layer -f
+```
+
+Update:
+
+```bash
+cd /opt/notif-layer
+sudo git pull
+sudo go build -o /opt/notif-layer/notif-layer ./cmd/local
+sudo systemctl restart notif-layer
+```
+
 ## Tes lokal
 
 ```powershell

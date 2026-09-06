@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram layer notifier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/notif-layer
+ExecStart=/opt/notif-layer/notif-layer
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
